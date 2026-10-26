@@ -1,39 +1,21 @@
 """
-Daily Sales Forecasting — Local Web Application
+Daily Sales Forecasting — Web Application (Frontend)
 
-A clean, modern, and professional web application for forecasting future daily sales
-using historical sales data and the validated two-stage machine learning pipeline.
+Client interface connecting to the FastAPI backend service (Render or local).
+Preserves the exact design, typography, date cards, KPI displays, Plotly charts,
+data table, and 1-click CSV download.
 """
 
-from pathlib import Path
+import os
 import io
 import warnings
+from typing import Optional, Tuple, Dict, Any
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go  # type: ignore
+import requests
 import streamlit as st
-
-# Local modules
-from forecasting_engine import (
-    load_model_artifact,
-    prepare_daily_sales_series,
-    generate_forecast,
-    compute_forecast_kpis,
-)
-from data_loader import resolve_default_paths, load_raw_dataset
-
-# If executed directly with `python app.py` instead of `streamlit run app.py`,
-# bootstrap Streamlit automatically so the user never gets ScriptRunContext errors.
-if __name__ == "__main__":
-    try:
-        import streamlit as _st
-        if hasattr(_st, "runtime") and not _st.runtime.exists():
-            import sys
-            from streamlit.web import cli as _stcli
-            sys.argv = ["streamlit", "run", sys.argv[0]]
-            sys.exit(_stcli.main())
-    except Exception:
-        pass
 
 # ---------------------------------------------------------
 # Page Configuration
@@ -44,6 +26,20 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed",
 )
+
+# ---------------------------------------------------------
+# Backend URL Configuration
+# ---------------------------------------------------------
+BACKEND_URL = os.getenv("BACKEND_URL")
+if not BACKEND_URL:
+    try:
+        BACKEND_URL = st.secrets.get("BACKEND_URL")
+    except Exception:
+        pass
+if not BACKEND_URL:
+    BACKEND_URL = "http://127.0.0.1:8000"
+
+BACKEND_URL = BACKEND_URL.rstrip("/")
 
 # ---------------------------------------------------------
 # Premium, Clean CSS Styling (Light Theme)
@@ -196,7 +192,7 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------
-# Helper Functions
+# Formatting Utilities
 # ---------------------------------------------------------
 def format_date(dt: pd.Timestamp) -> str:
     """Format dates consistently as DD Mon YYYY (e.g. 30 Jun 2014)."""
@@ -213,33 +209,71 @@ def format_number(val: float, decimals: int = 2) -> str:
 
 
 # ---------------------------------------------------------
-# Internal Data and Model Loading (No Settings UI Controls)
+# Backend API Calls (Cached for Fast Responsive UI)
 # ---------------------------------------------------------
-default_csv, default_model = resolve_default_paths()
-
-raw_df = None
-if default_csv is not None and default_csv.exists():
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_metadata(url: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Fetch dataset boundaries from backend GET /metadata."""
     try:
-        raw_df = load_raw_dataset(default_csv)
+        resp = requests.get(f"{url}/metadata", timeout=30)
+        resp.raise_for_status()
+        return resp.json(), None
+    except requests.exceptions.Timeout:
+        return None, "Connection timed out while reaching the backend service."
+    except requests.exceptions.ConnectionError:
+        return None, f"Could not connect to backend at {url}. Service may be starting up."
     except Exception as e:
-        st.error(f"Error loading sales dataset: {e}")
-else:
-    st.error("Sales dataset CSV not found in project folder.")
+        return None, str(e)
 
-model_artifact = None
-if default_model is not None and default_model.exists():
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_history(url: str, window_choice: str) -> Tuple[pd.Series, Optional[str]]:
+    """Fetch historical daily sales from backend GET /history."""
+    mapping = {
+        "Recent 90 Days": "90",
+        "Recent 180 Days": "180",
+        "Recent 365 Days": "365",
+        "Full History": "full",
+    }
+    days_val = mapping.get(window_choice, "90")
     try:
-        model_artifact = load_model_artifact(default_model)
+        resp = requests.get(f"{url}/history", params={"days": days_val}, timeout=30)
+        resp.raise_for_status()
+        records = resp.json().get("records", [])
+        if not records:
+            return pd.Series(dtype=float), None
+        df_hist = pd.DataFrame(records)
+        df_hist["date"] = pd.to_datetime(df_hist["date"])
+        df_hist.set_index("date", inplace=True)
+        return df_hist["sales"].astype(float), None
     except Exception as e:
-        st.error(f"Error loading model artifact: {e}")
-else:
-    st.error("Model artifact `final_sales_forecast_model.joblib` not found in project folder.")
+        return pd.Series(dtype=float), str(e)
+
+
+def request_forecast(url: str, horizon_days: int) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Call backend POST /forecast."""
+    try:
+        resp = requests.post(f"{url}/forecast", json={"horizon_days": horizon_days}, timeout=45)
+        resp.raise_for_status()
+        return resp.json(), None
+    except requests.exceptions.Timeout:
+        return None, "Forecast computation timed out. Please retry."
+    except requests.exceptions.ConnectionError:
+        return None, f"Connection to {url} lost. Service may be sleeping or restarting."
+    except requests.exceptions.HTTPError as e:
+        detail = "Forecast request error"
+        try:
+            detail = resp.json().get("detail", str(e))
+        except Exception:
+            detail = str(e)
+        return None, detail
+    except Exception as e:
+        return None, str(e)
 
 
 # ---------------------------------------------------------
-# Main Application Content
+# Main Page Header
 # ---------------------------------------------------------
-# Page Title & Subtitle
 st.markdown(
     """
     <div class="app-header">
@@ -250,27 +284,28 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-if raw_df is None or model_artifact is None:
+# Fetch Metadata from Backend
+metadata, meta_error = fetch_metadata(BACKEND_URL)
+if meta_error or metadata is None:
     st.error(
-        "Application cannot proceed without both a valid sales dataset and the trained model artifact. "
-        "Please ensure the project files are present in the project folder."
+        f"⚠️ **Backend Connection Unavailable**\n\n"
+        f"Unable to reach the forecasting backend service at `{BACKEND_URL}`.\n\n"
+        f"**Error Details:** {meta_error}\n\n"
+        f"*Note for Render deployments:* If hosted on Render free tier, web services automatically sleep after inactivity "
+        f"and can take 30–60 seconds to spin up. Please wait a moment and click **Retry Connection** below."
     )
+    if st.button("🔄 Retry Connection", type="primary"):
+        st.cache_data.clear()
+        st.rerun()
     st.stop()
 
-# Prepare continuous daily sales series
-try:
-    daily_series = prepare_daily_sales_series(raw_df)
-except Exception as e:
-    st.error(f"Data processing error: {e}")
-    st.stop()
-
-dataset_start_date = daily_series.index.min()
-dataset_end_date = daily_series.index.max()
-forecast_start_date = dataset_end_date + pd.Timedelta(days=1)
+dataset_start_date = pd.to_datetime(metadata["dataset_start_date"])
+dataset_end_date = pd.to_datetime(metadata["dataset_end_date"])
+forecast_start_date = pd.to_datetime(metadata["forecast_starts_on"])
 
 
 # ---------------------------------------------------------
-# Forecast Horizon Selector & Predict Button
+# Horizon Selector & Predict Button
 # ---------------------------------------------------------
 col_horizon, col_btn, col_history_view = st.columns([1.5, 0.9, 1.2])
 
@@ -292,7 +327,7 @@ with col_btn:
         "Predict Forecast",
         type="primary",
         use_container_width=True,
-        help="Click to generate daily sales forecast for the selected horizon.",
+        help="Click to generate daily sales forecast from the backend API for the selected horizon.",
     )
 
 with col_history_view:
@@ -333,7 +368,7 @@ st.markdown(
 
 
 # ---------------------------------------------------------
-# Generate Forecast Execution (Triggered by Button)
+# Forecast Execution & Session State Management
 # ---------------------------------------------------------
 if "forecast_df" not in st.session_state:
     st.session_state["forecast_df"] = None
@@ -342,21 +377,31 @@ if "forecast_df" not in st.session_state:
     st.session_state["forecast_choice"] = None
 
 if predict_btn:
-    with st.spinner(f"Generating {horizon_choice} sales forecast..."):
-        try:
-            forecast_df = generate_forecast(
-                daily_series=daily_series,
-                model_artifact=model_artifact,
-                n_days=horizon_days,
-            )
-            kpis = compute_forecast_kpis(forecast_df)
-            st.session_state["forecast_df"] = forecast_df
-            st.session_state["forecast_kpis"] = kpis
-            st.session_state["forecast_horizon"] = horizon_days
-            st.session_state["forecast_choice"] = horizon_choice
-        except Exception as e:
-            st.error(f"Forecasting error: {e}")
+    with st.spinner(f"Requesting {horizon_choice} forecast from backend API..."):
+        fc_payload, fc_err = request_forecast(BACKEND_URL, horizon_days)
+        if fc_err or fc_payload is None:
+            st.error(f"Error generating forecast from API: {fc_err}")
             st.stop()
+
+        # Parse forecast data into DataFrame
+        records = fc_payload.get("forecast", [])
+        df_parsed = pd.DataFrame(records)
+        df_parsed["date"] = pd.to_datetime(df_parsed["date"])
+        df_parsed.set_index("date", inplace=True)
+        df_parsed.rename(
+            columns={
+                "predicted_sales": "Predicted_Sales",
+                "probability_of_sale": "Probability_of_Sale",
+                "median_component": "Median_Component",
+                "expected_component": "Expected_Component",
+            },
+            inplace=True,
+        )
+
+        st.session_state["forecast_df"] = df_parsed
+        st.session_state["forecast_kpis"] = fc_payload.get("kpis", {})
+        st.session_state["forecast_horizon"] = horizon_days
+        st.session_state["forecast_choice"] = horizon_choice
 
 if st.session_state["forecast_df"] is None:
     st.markdown(
@@ -365,7 +410,7 @@ if st.session_state["forecast_df"] is None:
             <div style="font-size: 2.2rem; margin-bottom: 0.5rem;">📈</div>
             <h3 style="font-size: 1.25rem; font-weight: 700; color: #0F172A; margin-bottom: 0.4rem;">Forecast Ready to Generate</h3>
             <p style="font-size: 0.95rem; color: #64748B; max-width: 520px; margin: 0 auto;">
-                Select your desired horizon (30, 60, or 90 Days) above and click <strong>Predict Forecast</strong> to calculate projected daily sales, KPIs, and interactive charts.
+                Select your desired horizon (30, 60, or 90 Days) above and click <strong>Predict Forecast</strong> to calculate projected daily sales, KPIs, and interactive charts via the backend API.
             </p>
         </div>
         """,
@@ -387,28 +432,32 @@ if active_horizon != horizon_days:
 # ---------------------------------------------------------
 # Primary Forecast Results (KPI Cards)
 # ---------------------------------------------------------
+kpi_max_date = pd.to_datetime(kpis.get("highest_sales_day_date"))
+kpi_start_date = pd.to_datetime(kpis.get("start_date"))
+kpi_end_date = pd.to_datetime(kpis.get("end_date"))
+
 st.markdown(
     f"""
     <div class="kpi-grid">
         <div class="kpi-card">
             <div class="kpi-title">Total Forecast Sales</div>
-            <div class="kpi-number">{format_number(kpis['total_sales'])}</div>
+            <div class="kpi-number">{format_number(kpis.get('total_sales', 0.0))}</div>
             <div class="kpi-subtext">Sum of predicted daily sales for {active_choice}</div>
         </div>
         <div class="kpi-card">
             <div class="kpi-title">Average Daily Sales</div>
-            <div class="kpi-number">{format_number(kpis['average_daily_sales'])}</div>
+            <div class="kpi-number">{format_number(kpis.get('average_daily_sales', 0.0))}</div>
             <div class="kpi-subtext">Mean predicted sales per day over horizon</div>
         </div>
         <div class="kpi-card">
             <div class="kpi-title">Forecast Period</div>
             <div class="kpi-number">{active_horizon} Days</div>
-            <div class="kpi-subtext">{format_date(kpis['start_date'])} to {format_date(kpis['end_date'])}</div>
+            <div class="kpi-subtext">{format_date(kpi_start_date)} to {format_date(kpi_end_date)}</div>
         </div>
         <div class="kpi-card">
             <div class="kpi-title">Highest Predicted Day</div>
-            <div class="kpi-number">{format_number(kpis['highest_sales_day_value'])}</div>
-            <div class="kpi-subtext">Expected on {format_date(kpis['highest_sales_day_date'])}</div>
+            <div class="kpi-number">{format_number(kpis.get('highest_sales_day_value', 0.0))}</div>
+            <div class="kpi-subtext">Expected on {format_date(kpi_max_date)}</div>
         </div>
     </div>
     """,
@@ -421,37 +470,32 @@ st.markdown(
 # ---------------------------------------------------------
 st.markdown("### Historical Sales & Future Forecast")
 
-# Slice historical series based on user selection
-if history_window == "Recent 90 Days":
-    hist_slice = daily_series.iloc[-90:]
-elif history_window == "Recent 180 Days":
-    hist_slice = daily_series.iloc[-180:]
-elif history_window == "Recent 365 Days":
-    hist_slice = daily_series.iloc[-365:]
-else:
-    hist_slice = daily_series
+hist_slice, hist_err = fetch_history(BACKEND_URL, history_window)
+if hist_err:
+    st.warning(f"Unable to load historical context from API: {hist_err}")
 
 fig = go.Figure()
 
-# 1. Historical Actual Sales trace
-fig.add_trace(
-    go.Scatter(
-        x=hist_slice.index,
-        y=hist_slice.values,
-        mode="lines",
-        name="Historical Actual Sales",
-        line=dict(color="#475569", width=1.5),
-        hovertemplate="<b>Date:</b> %{x|%d %b %Y}<br><b>Actual Sales:</b> %{y:,.2f}<extra></extra>",
+# Historical Actual Sales trace
+if not hist_slice.empty:
+    fig.add_trace(
+        go.Scatter(
+            x=hist_slice.index,
+            y=hist_slice.values,
+            mode="lines",
+            name="Historical Actual Sales",
+            line=dict(color="#475569", width=1.5),
+            hovertemplate="<b>Date:</b> %{x|%d %b %Y}<br><b>Actual Sales:</b> %{y:,.2f}<extra></extra>",
+        )
     )
-)
 
-# 2. Forecasted Daily Sales trace (distinct bold color)
+# Forecasted Daily Sales trace
 fig.add_trace(
     go.Scatter(
         x=forecast_df.index,
         y=forecast_df["Predicted_Sales"],
         mode="lines+markers",
-        name=f"Forecasted Daily Sales ({horizon_choice})",
+        name=f"Forecasted Daily Sales ({active_choice})",
         line=dict(color="#2563EB", width=2.5),
         marker=dict(size=4, color="#2563EB"),
         hovertemplate="<b>Forecast Date:</b> %{x|%d %b %Y}<br><b>Predicted Sales:</b> %{y:,.2f}<extra></extra>",
@@ -466,7 +510,6 @@ fig.add_vline(
     line_color="#94A3B8",
 )
 
-# Add clear annotation for the boundary
 fig.add_annotation(
     x=forecast_start_date,
     y=1.03,
@@ -521,7 +564,6 @@ col_weekly_chart, col_table = st.columns([1.2, 1.0])
 with col_weekly_chart:
     st.markdown("### Weekly Forecast Aggregation")
     
-    # Resample forecast into weekly sums to show actionable business trends
     weekly_forecast = forecast_df["Predicted_Sales"].resample("W-SUN").sum().to_frame()
     weekly_forecast.columns = ["Weekly_Sales"]
     weekly_forecast["Week_Label"] = [
@@ -562,7 +604,6 @@ with col_weekly_chart:
 with col_table:
     st.markdown("### Forecast Data Table")
 
-    # Table formatted cleanly
     display_table = pd.DataFrame(
         {
             "Forecast Date": [format_date(d) for d in forecast_df.index],
@@ -578,7 +619,6 @@ with col_table:
     )
 
     # Clean Download CSV Button
-    # Only export Date and Predicted Daily Sales (no private source data)
     csv_buffer = io.StringIO()
     export_df = pd.DataFrame(
         {
