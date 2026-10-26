@@ -1,0 +1,36 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+
+# Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment variables & secrets
+.env
+.env.*
+.streamlit/secrets.toml
+
+# Streamlit run cache & local configs
+.streamlit/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Raw transaction dataset with sensitive PII (customer/employee contact info)
+New_Query_*.csv
+
+# Temporary files, scratch scripts & logs
+scratch/
+*.log
+tmp/
+
+# OS generated files
+.DS_Store
+Thumbs.db
